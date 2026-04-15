@@ -1,6 +1,11 @@
 import os
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from typing import BinaryIO
+import regex as re
 
+PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
 def find_chunk_boundaries(
     file: BinaryIO,
@@ -49,14 +54,63 @@ def find_chunk_boundaries(
     return sorted(set(chunk_boundaries))
 
 
-## Usage
-with open(..., "rb") as f:
-    num_processes = 4
-    boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
+def pretokenize_file(
+    file_path: str | os.PathLike,
+    num_processes: int = 10,
+    split_special_token: bytes = b"<|endoftext|>",
+) -> dict[tuple[int, ...], int]:
+    """
+    Returns:
+        A dictionary mapping each pre-token (represented as a tuple of byte values)
+        to the number of times it occurs.
+    """
+    if num_processes <= 0:
+        raise ValueError("num_processes must be a positive integer")
 
-    # The following is a serial implementation, but you can parallelize this
-    # by sending each start/end pair to a set of processes.
-    for start, end in zip(boundaries[:-1], boundaries[1:]):
+    with open(file_path, "rb") as f:
+        boundaries = find_chunk_boundaries(f, num_processes, split_special_token)
+
+    chunk_ranges = list(zip(boundaries[:-1], boundaries[1:]))
+    if not chunk_ranges:
+        return {}
+
+    # Each chunk range is handled in its own worker process.
+    worker_inputs = [
+        (str(file_path), start, end, split_special_token)
+        for start, end in chunk_ranges
+    ]
+    max_workers = min(len(worker_inputs), os.cpu_count() or 1)
+    try:
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            chunk_counts = list(executor.map(_pretokenize_chunk, worker_inputs))
+    except (PermissionError, RuntimeError, BrokenProcessPool):
+        # Fallback for restricted or non-safe multiprocessing entrypoints.
+        chunk_counts = [_pretokenize_chunk(item) for item in worker_inputs]
+
+    token_counts: dict[tuple[int, ...], int] = defaultdict(int)
+    for chunk_count in chunk_counts:
+        for token, count in chunk_count.items():
+            token_counts[token] += count
+
+    return dict(token_counts)
+
+
+def _pretokenize_chunk(
+    args: tuple[str, int, int, bytes],
+) -> dict[tuple[int, ...], int]:
+    file_path, start, end, split_special_token = args
+    split_special_token_str = split_special_token.decode("utf-8")
+
+    with open(file_path, "rb") as f:
         f.seek(start)
         chunk = f.read(end - start).decode("utf-8", errors="ignore")
-        # Run pre-tokenization on your chunk and store the counts for each pre-token
+
+    token_counts: dict[tuple[int, ...], int] = defaultdict(int)
+    parts = chunk.split(split_special_token_str)
+    for i, part in enumerate(parts):
+        for token in re.findall(PAT, part):
+            token_counts[tuple(token.encode("utf-8"))] += 1
+        if i < len(parts) - 1:
+            token_counts[tuple(split_special_token)] += 1
+
+    return dict(token_counts)
