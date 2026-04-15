@@ -1,4 +1,5 @@
 import os
+import heapq
 import time
 from abc import ABC
 from collections import defaultdict
@@ -21,6 +22,40 @@ def merge(indices: list[int], pair: tuple[int, int], new_index: int) -> list[int
             new_indices.append(indices[i])
             i += 1
     return new_indices
+
+
+def merge_tuple(indices: tuple[int, ...], pair: tuple[int, int], new_index: int) -> tuple[int, ...]:
+    """Tuple-native version of `merge` to avoid list conversions in training."""
+    new_indices: list[int] = []
+    i = 0
+    while i < len(indices):
+        if i + 1 < len(indices) and indices[i] == pair[0] and indices[i + 1] == pair[1]:
+            new_indices.append(new_index)
+            i += 2
+        else:
+            new_indices.append(indices[i])
+            i += 1
+    return tuple(new_indices)
+
+
+@dataclass(frozen=True)
+class _PairHeapEntry:
+    count: int
+    pair: tuple[int, int]
+    left_bytes: bytes
+    right_bytes: bytes
+
+    def __lt__(self, other: object) -> bool:
+        if not isinstance(other, _PairHeapEntry):
+            return NotImplemented
+        # Reverse order so heapq(min-heap) picks:
+        # max(count), then max(left_bytes), then max(right_bytes).
+        if self.count != other.count:
+            return self.count > other.count
+        if self.left_bytes != other.left_bytes:
+            return self.left_bytes > other.left_bytes
+        return self.right_bytes > other.right_bytes
+
 
 class Tokenizer(ABC):
     """Abstract interface for a tokenizer."""
@@ -164,40 +199,102 @@ def train_tokenizer(input_path: (str | os.PathLike), vocab_size: int, special_to
     merges: list[tuple[bytes, bytes]] = []
     vocab: dict[int, bytes] = {x: bytes([x]) for x in range(256)}
 
+    # Compact word store: each unique pretokenized word once with frequency.
+    words_by_id: dict[int, tuple[int, ...]] = {}
+    word_freq_by_id: dict[int, int] = {}
+    # Per-word pair multiplicities, e.g. (a, b) might occur multiple times in a word.
+    word_pair_counts_by_id: dict[int, dict[tuple[int, int], int]] = {}
+
+    pair_counts: dict[tuple[int, int], int] = collections.defaultdict(int)
+    pair_to_word_ids: dict[tuple[int, int], set[int]] = collections.defaultdict(set)
+
+    for word_id, (word, freq) in enumerate(word_counts.items()):
+        words_by_id[word_id] = word
+        word_freq_by_id[word_id] = freq
+
+        local_pair_counts: dict[tuple[int, int], int] = collections.defaultdict(int)
+        for pair in zip(word, word[1:]):
+            local_pair_counts[pair] += 1
+        word_pair_counts_by_id[word_id] = dict(local_pair_counts)
+
+        for pair, occurrences in local_pair_counts.items():
+            pair_counts[pair] += occurrences * freq
+            pair_to_word_ids[pair].add(word_id)
+
+    pair_heap: list[_PairHeapEntry] = []
+    for pair, count in pair_counts.items():
+        if count > 0:
+            pair_heap.append(_PairHeapEntry(count, pair, vocab[pair[0]], vocab[pair[1]]))
+    heapq.heapify(pair_heap)
+
     num_merges = vocab_size - len(special_tokens) - 256
     if num_merges > 0:
-        for i in range(num_merges):
-            print(f"iteration{i} of {num_merges}")
-            pair_counts: dict[tuple[int, int], int] = collections.defaultdict(int)
-            for word, freq in word_counts.items():
-                for pair in zip(word, word[1:]):
-                    pair_counts[pair] += freq
-
-            if not pair_counts:
+        for _ in range(num_merges):
+            best_pair: tuple[int, int] | None = None
+            while pair_heap:
+                candidate = heapq.heappop(pair_heap)
+                current_count = pair_counts.get(candidate.pair, 0)
+                # Skip stale heap entries.
+                if current_count <= 0 or current_count != candidate.count:
+                    continue
+                best_pair = candidate.pair
                 break
 
-            best_pair = max(
-                pair_counts.items(),
-                key=lambda item: (
-                    item[1],
-                    vocab[item[0][0]],
-                    vocab[item[0][1]],
-                ),
-            )[0]
+            if best_pair is None:
+                break
+
             left_id, right_id = best_pair
             new_id = len(vocab)
             vocab[new_id] = vocab[left_id] + vocab[right_id]
             merges.append((vocab[left_id], vocab[right_id]))
 
-            updated_word_counts: dict[tuple[int, ...], int] = collections.defaultdict(int)
-            for word, freq in word_counts.items():
-                merged_word = tuple(merge(list(word), best_pair, new_id))
-                updated_word_counts[merged_word] += freq
-            word_counts = dict(updated_word_counts)
+            affected_word_ids = list(pair_to_word_ids.get(best_pair, set()))
+            for word_id in affected_word_ids:
+                freq = word_freq_by_id[word_id]
+                old_word_pair_counts = word_pair_counts_by_id[word_id]
 
+                # Remove old pair contributions for this word.
+                for pair, occurrences in old_word_pair_counts.items():
+                    updated_total = pair_counts[pair] - (occurrences * freq)
+                    if updated_total > 0:
+                        pair_counts[pair] = updated_total
+                        heapq.heappush(
+                            pair_heap,
+                            _PairHeapEntry(updated_total, pair, vocab[pair[0]], vocab[pair[1]]),
+                        )
+                    else:
+                        pair_counts.pop(pair, None)
+
+                    pair_word_ids = pair_to_word_ids.get(pair)
+                    if pair_word_ids is not None:
+                        pair_word_ids.discard(word_id)
+                        if not pair_word_ids:
+                            pair_to_word_ids.pop(pair, None)
+
+                # Merge selected pair in this word.
+                merged_word = merge_tuple(words_by_id[word_id], best_pair, new_id)
+                words_by_id[word_id] = merged_word
+
+                # Add new pair contributions for this word.
+                new_word_pair_counts: dict[tuple[int, int], int] = collections.defaultdict(int)
+                for pair in zip(merged_word, merged_word[1:]):
+                    new_word_pair_counts[pair] += 1
+                word_pair_counts_by_id[word_id] = dict(new_word_pair_counts)
+
+                for pair, occurrences in new_word_pair_counts.items():
+                    pair_counts[pair] = pair_counts.get(pair, 0) + (occurrences * freq)
+                    pair_to_word_ids[pair].add(word_id)
+                    heapq.heappush(
+                        pair_heap,
+                        _PairHeapEntry(pair_counts[pair], pair, vocab[pair[0]], vocab[pair[1]]),
+                    )
+
+    vocab_values = set(vocab.values())
     for special_token in special_tokens:
         special_token_bytes_value = special_token.encode("utf-8")
-        if special_token_bytes_value not in vocab.values():
+        if special_token_bytes_value not in vocab_values:
             vocab[len(vocab)] = special_token_bytes_value
-
+            vocab_values.add(special_token_bytes_value)
+    end_time = time.time()
+    print(f"Finished in {end_time - start_time} seconds.")
     return vocab, merges
