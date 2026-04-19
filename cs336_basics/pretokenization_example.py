@@ -56,7 +56,7 @@ def find_chunk_boundaries(
 
 def pretokenize_file(
     file_path: str | os.PathLike,
-    num_processes: int = 10,
+    num_processes: int = 20,
     split_special_token: bytes = b"<|endoftext|>",
 ) -> dict[tuple[int, ...], int]:
     """
