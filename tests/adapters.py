@@ -12,6 +12,7 @@ from torch import Tensor
 from cs336_basics.bpe_tokenizer import BPETokenizerParams, BPETokenizer, train_tokenizer
 from cs336_basics.models.embedding import Embedding
 from cs336_basics.models.linear import Linear
+from cs336_basics.models.multihead_self_attention import MultiHeadSelfAttention
 from cs336_basics.models.rms_norm import RMSNorm
 from cs336_basics.models.ro_pe import RoPE
 from cs336_basics.models.scaled_dot_product_attention import scaled_dot_product_attention
@@ -150,7 +151,17 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    max_seq_len = in_features.shape[-3]
+    attention = MultiHeadSelfAttention(
+        d_model=d_model,
+        num_heads=num_heads,
+        max_seq_len=max_seq_len
+    )
+    attention.W_O.load_state_dict({"weights": o_proj_weight})
+    attention.W_V.load_state_dict({"weights": v_proj_weight})
+    attention.W_K.load_state_dict({"weights": k_proj_weight})
+    attention.W_Q.load_state_dict({"weights": q_proj_weight})
+    return attention.forward(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -190,7 +201,17 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_model"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    attention = MultiHeadSelfAttention(
+        d_model=d_model,
+        num_heads=num_heads,
+        max_seq_len=max_seq_len,
+        theta=theta,
+    )
+    attention.W_O.load_state_dict({"weights": o_proj_weight})
+    attention.W_V.load_state_dict({"weights": v_proj_weight})
+    attention.W_K.load_state_dict({"weights": k_proj_weight})
+    attention.W_Q.load_state_dict({"weights": q_proj_weight})
+    return attention.forward(in_features)
 
 
 def run_rope(
