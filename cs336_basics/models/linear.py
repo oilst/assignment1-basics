@@ -9,10 +9,10 @@ class Linear(nn.Module):
         super(Linear, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.weights = nn.Parameter(torch.Tensor(out_features, in_features))
+        self.weight = nn.Parameter(torch.Tensor(out_features, in_features))
         std = math.sqrt(2/(in_features+out_features))
-        nn.init.trunc_normal_(self.weights, std=std, a=-3*std, b=3*std)
+        nn.init.trunc_normal_(self.weight, std=std, a=-3 * std, b=3 * std)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         #use einops
-        return einsum('... i, o i -> ... o', x, self.weights)
+        return einsum('... i, o i -> ... o', x, self.weight)
