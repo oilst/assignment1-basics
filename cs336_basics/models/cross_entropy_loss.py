@@ -1,9 +1,11 @@
 import torch
 import torch.nn.functional as F
 from einops import einsum
+from jaxtyping._array_types import Float, Int
+from torch import Tensor
 
 
-def cross_entropy_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+def cross_entropy(inputs: Float[Tensor, "batch_size vocab_size"], targets: Int[Tensor, "batch_size"]):
     """Compute mean cross-entropy for logits of shape ``(..., vocab_size)``.
 
     Args:
@@ -16,9 +18,8 @@ def cross_entropy_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Ten
         Scalar tensor containing the average negative log-likelihood over all examples.
     """
     # Loss - log (exp(l_k) / Sum_j exp(l_j)) = log (Sum_j exp(l_j)) - l_k if k is the index of the gt
-    shifted_logits = logits - torch.max(logits, dim=-1, keepdim=True).values
-    target_mask = F.one_hot(targets, num_classes=shifted_logits.size(-1)).to(shifted_logits.dtype)
-    target_logits = einsum(shifted_logits, target_mask, "... vocab_size,... vocab_size->...")
-    log_normalizer = torch.log(torch.sum(torch.exp(shifted_logits), dim=-1))
-
-    return (log_normalizer - target_logits).mean()
+    x_max = torch.max(inputs, dim=1, keepdim=True).values
+    diff = inputs - x_max
+    x_exp = torch.exp(diff)
+    #nice trick by abhinav to slice the GT value
+    return -(diff[torch.arange(inputs.shape[0]), targets] - torch.log(x_exp.sum(dim=1))).mean()
