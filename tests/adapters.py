@@ -9,9 +9,10 @@ import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
+from cs336_basics.adam import learning_rate_cosine_anneal, AdamW
 from cs336_basics.bpe_tokenizer import BPETokenizerParams, BPETokenizer, train_tokenizer
+from cs336_basics.models.cross_entropy_loss import cross_entropy
 from cs336_basics.models.embedding import Embedding
-from cs336_basics.models.cross_entropy_loss import cross_entropy_loss
 from cs336_basics.models.linear import Linear
 from cs336_basics.models.multihead_self_attention import MultiHeadSelfAttention
 from cs336_basics.models.rms_norm import RMSNorm
@@ -21,6 +22,7 @@ from cs336_basics.models.softmax import softmax
 from cs336_basics.models.swi_glu import SwiGLU
 from cs336_basics.models.transformer_block import TransformerBlock
 from cs336_basics.models.transformer_lm import TransformerLM
+
 
 
 def run_linear(
@@ -542,7 +544,7 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    return cross_entropy_loss(inputs, targets)
+    return cross_entropy(inputs, targets)
 
 
 def run_gradient_clipping(parameters: Iterable[torch.nn.Parameter], max_l2_norm: float) -> None:
@@ -561,7 +563,7 @@ def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(
@@ -589,7 +591,7 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    return learning_rate_cosine_anneal(it, max_learning_rate, min_learning_rate, warmup_iters, cosine_cycle_iters)
 
 
 def run_save_checkpoint(
