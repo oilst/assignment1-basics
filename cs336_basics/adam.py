@@ -4,6 +4,28 @@ from typing import Optional
 
 import torch
 
+
+@torch.no_grad()
+def gradient_clipping(
+    parameters: Iterable[torch.nn.Parameter],
+    max_l2_norm: float,
+    eps: float = 1e-6,
+) -> None:
+    grads = [p.grad for p in parameters if p.grad is not None]
+    if len(grads) == 0:
+        return
+
+    total_norm = torch.linalg.vector_norm(
+        torch.stack([torch.linalg.vector_norm(grad.detach(), 2) for grad in grads]),
+        2,
+    )
+    clip_coef = max_l2_norm / (total_norm + eps)
+    clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
+
+    for grad in grads:
+        grad.mul_(clip_coef_clamped.to(grad.device))
+
+
 def learning_rate_cosine_anneal(
     it: int,
     max_learning_rate: float,
