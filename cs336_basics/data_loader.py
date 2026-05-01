@@ -33,8 +33,8 @@ def get_batch(
     for start_idx in start_indices:
         input_seq = dataset[start_idx : start_idx + context_length]
         label_seq = dataset[start_idx + 1 : start_idx + context_length + 1]
-        input_sequences.append(torch.LongTensor(input_seq))
-        label_sequences.append(torch.LongTensor(label_seq))
+        input_sequences.append(torch.as_tensor(input_seq.copy(), dtype=torch.long))
+        label_sequences.append(torch.as_tensor(label_seq.copy(), dtype=torch.long))
 
     device = torch.device(device)
 
