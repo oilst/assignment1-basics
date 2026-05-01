@@ -1,8 +1,8 @@
-import os
 import heapq
+import json
+import os
 import time
 from abc import ABC
-from collections import defaultdict
 from dataclasses import dataclass
 import regex as re
 import collections
@@ -73,6 +73,8 @@ class BPETokenizerParams:
 
 class BPETokenizer(Tokenizer):
     """BPE tokenizer given a set of merges and a vocabulary."""
+    _STATE_VERSION = 1
+
     def __init__(self, params: BPETokenizerParams):
         self.params = params
         self._pretoken_pattern = re.compile(
@@ -96,6 +98,65 @@ class BPETokenizer(Tokenizer):
             )
         else:
             self._special_token_pattern = None
+
+    def to_state_dict(self) -> dict[str, object]:
+        """Return a JSON-serializable representation of this tokenizer."""
+        return {
+            "version": self._STATE_VERSION,
+            "vocab": [
+                [token_id, list(token_bytes)]
+                for token_id, token_bytes in sorted(self.params.vocab.items())
+            ],
+            "merges": [
+                [list(left), list(right)]
+                for left, right in self.params.merges
+            ],
+            "special_tokens": list(self._special_tokens),
+        }
+
+    @classmethod
+    def from_state_dict(cls, state: dict[str, object]) -> "BPETokenizer":
+        """Build a tokenizer from the output of `to_state_dict`."""
+        version = state.get("version")
+        if version != cls._STATE_VERSION:
+            raise ValueError(f"Unsupported BPETokenizer state version: {version}")
+
+        vocab_data = state["vocab"]
+        merges_data = state["merges"]
+        special_tokens_data = state.get("special_tokens", [])
+
+        vocab = {
+            int(token_id): bytes(token_bytes)
+            for token_id, token_bytes in vocab_data
+        }
+        merges = [
+            (bytes(left), bytes(right))
+            for left, right in merges_data
+        ]
+        special_tokens = [str(token) for token in special_tokens_data]
+
+        return cls(BPETokenizerParams(vocab=vocab, merges=merges, special_tokens=special_tokens))
+
+    def save(self, path: str | os.PathLike) -> None:
+        """Store the tokenizer state as JSON at `path`."""
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.to_state_dict(), f, separators=(",", ":"))
+
+    @classmethod
+    def load(cls, path: str | os.PathLike) -> "BPETokenizer":
+        """Load a tokenizer state previously written by `save`."""
+        with open(path, encoding="utf-8") as f:
+            state = json.load(f)
+        return cls.from_state_dict(state)
+
+    def to_file(self, path: str | os.PathLike) -> None:
+        """Alias for `save`."""
+        self.save(path)
+
+    @classmethod
+    def from_file(cls, path: str | os.PathLike) -> "BPETokenizer":
+        """Alias for `load`."""
+        return cls.load(path)
 
     def _encode_pretoken(self, string: str) -> list[int]:
         indices = [self._bytes_to_indices[bytes([byte])] for byte in string.encode("utf-8")]
