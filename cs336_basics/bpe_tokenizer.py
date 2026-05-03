@@ -6,6 +6,8 @@ from abc import ABC
 from dataclasses import dataclass
 import regex as re
 import collections
+from collections.abc import Iterable, Iterator
+from functools import lru_cache
 
 from cs336_basics.pretokenization_example import pretokenize_file
 
@@ -61,6 +63,8 @@ class Tokenizer(ABC):
     """Abstract interface for a tokenizer."""
     def encode(self, string: str) -> list[int]:
         raise NotImplementedError
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        raise NotImplementedError
     def decode(self, indices: list[int]) -> str:
         raise NotImplementedError
 
@@ -82,6 +86,15 @@ class BPETokenizer(Tokenizer):
             re.IGNORECASE,
         )
         self._bytes_to_indices = {value: key for key, value in self.params.vocab.items()}
+        self._merge_pair_to_rank: dict[tuple[int, int], int] = {}
+        self._merge_pair_to_new_id: dict[tuple[int, int], int] = {}
+        for rank, pair in enumerate(self.params.merges):
+            left_id = self._bytes_to_indices[pair[0]]
+            right_id = self._bytes_to_indices[pair[1]]
+            new_id = self._bytes_to_indices[pair[0] + pair[1]]
+            idx_pair = (left_id, right_id)
+            self._merge_pair_to_rank[idx_pair] = rank
+            self._merge_pair_to_new_id[idx_pair] = new_id
         self._special_tokens = self.params.special_tokens or []
         self._special_token_to_id = {
             tok: self._bytes_to_indices[tok.encode("utf-8")]
@@ -158,13 +171,80 @@ class BPETokenizer(Tokenizer):
         """Alias for `load`."""
         return cls.load(path)
 
-    def _encode_pretoken(self, string: str) -> list[int]:
-        indices = [self._bytes_to_indices[bytes([byte])] for byte in string.encode("utf-8")]
-        # Note: this is a very slow implementation
-        for new_index, pair in enumerate(self.params.merges):
-            idx_pair = (self._bytes_to_indices[pair[0]], self._bytes_to_indices[pair[1]])
-            indices = merge(indices, idx_pair, new_index + 256)
+    def _streaming_suffix_length(self, string: str) -> int:
+        """Return the length of the suffix that may merge with the next chunk."""
+        if not string:
+            return 0
+
+        suffix_length = 0
+
+        # Whitespace handling in the GPT-2 pretokenization regex depends on
+        # the following character, and a final space can become the leading
+        # space of the next pretoken.
+        split_start = len(string)
+        while split_start > 0 and string[split_start - 1].isspace():
+            split_start -= 1
+
+        if split_start < len(string):
+            suffix_length = max(suffix_length, len(string) - split_start)
+        else:
+            # A trailing non-whitespace run can be continued by the next
+            # iterable chunk. Keep one leading space too, since GPT-2 pretokens
+            # include an optional literal space before words/numbers/punctuation.
+            while split_start > 0 and not string[split_start - 1].isspace():
+                split_start -= 1
+            if split_start > 0 and string[split_start - 1] == " ":
+                split_start -= 1
+            suffix_length = max(suffix_length, len(string) - split_start)
+
+        boundary_tokens = ["'s", "'t", "'re", "'ve", "'m", "'ll", "'d", *self._special_tokens]
+        for token in boundary_tokens:
+            for prefix_length in range(1, len(token)):
+                if string.endswith(token[:prefix_length]):
+                    suffix_length = max(suffix_length, prefix_length)
+
+        return suffix_length
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        """Encode strings from `iterable` lazily, yielding token IDs one at a time."""
+        buffer = ""
+        for chunk in iterable:
+            if not chunk:
+                continue
+            buffer += chunk
+            suffix_length = self._streaming_suffix_length(buffer)
+            encode_end = len(buffer) - suffix_length
+            if encode_end <= 0:
+                continue
+
+            yield from self.encode(buffer[:encode_end])
+            buffer = buffer[encode_end:]
+
+        if buffer:
+            yield from self.encode(buffer)
+
+    def _get_best_merge_pair(self, indices: tuple[int, ...]) -> tuple[int, int] | None:
+        best_pair: tuple[int, int] | None = None
+        best_rank: int | None = None
+        for pair in zip(indices, indices[1:]):
+            rank = self._merge_pair_to_rank.get(pair)
+            if rank is not None and (best_rank is None or rank < best_rank):
+                best_pair = pair
+                best_rank = rank
+        return best_pair
+
+    @lru_cache(maxsize=100_000)
+    def _encode_pretoken_cached(self, string: str) -> tuple[int, ...]:
+        indices = tuple(self._bytes_to_indices[bytes([byte])] for byte in string.encode("utf-8"))
+        while len(indices) >= 2:
+            best_pair = self._get_best_merge_pair(indices)
+            if best_pair is None:
+                break
+            indices = merge_tuple(indices, best_pair, self._merge_pair_to_new_id[best_pair])
         return indices
+
+    def _encode_pretoken(self, string: str) -> list[int]:
+        return list(self._encode_pretoken_cached(string))
 
     def _encode_ordinary_text(self, string: str) -> list[int]:
         indices: list[int] = []

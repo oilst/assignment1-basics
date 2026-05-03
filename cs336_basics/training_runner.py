@@ -94,11 +94,17 @@ def _build_model(config: dict[str, Any]) -> TransformerLM:
 
 def _build_optimizer(config: dict[str, Any], model: torch.nn.Module) -> AdamW:
     optimizer_config = config.get("optimizer", {})
-    betas = optimizer_config.get("betas", [0.9, 0.999])
+    betas = optimizer_config.get("betas")
+    if betas is None:
+        beta1 = float(optimizer_config.get("beta1", 0.9))
+        beta2 = float(optimizer_config.get("beta2", 0.999))
+    else:
+        beta1 = float(betas[0])
+        beta2 = float(betas[1])
     return AdamW(
         model.parameters(),
         lr=float(optimizer_config.get("lr", config.get("learning_rate", 1e-3))),
-        betas=(float(betas[0]), float(betas[1])),
+        betas=(beta1, beta2),
         eps=float(optimizer_config.get("eps", 1e-8)),
         weight_decay=float(optimizer_config.get("weight_decay", 0.0)),
     )
