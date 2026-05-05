@@ -1,6 +1,5 @@
 import math
 from collections.abc import Callable, Iterable
-from typing import Optional
 
 import torch
 
@@ -53,7 +52,7 @@ class SGD(torch.optim.Optimizer):
         super().__init__(params, defaults)
 
     @torch.no_grad()
-    def step(self, closure: Optional[Callable] = None):
+    def step(self, closure: Callable | None = None):
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -100,7 +99,7 @@ class AdamW(torch.optim.Optimizer):
         super().__init__(params, defaults)
 
     @torch.no_grad()
-    def step(self, closure: Optional[Callable] = None):
+    def step(self, closure: Callable | None = None):
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -116,15 +115,15 @@ class AdamW(torch.optim.Optimizer):
                 if p.grad is None:
                     continue
 
-                grad = p.grad.data
+                grad = p.grad.data.float()
                 if grad.is_sparse:
                     raise RuntimeError("AdamW does not support sparse gradients")
 
                 state = self.state[p]
                 if len(state) == 0:
                     state["step"] = 0
-                    state["m"] = torch.zeros_like(p.data)
-                    state["v"] = torch.zeros_like(p.data)
+                    state["m"] = torch.zeros_like(p.data, dtype=torch.float32)
+                    state["v"] = torch.zeros_like(p.data, dtype=torch.float32)
 
                 state["step"] += 1
                 t = state["step"]
@@ -139,6 +138,6 @@ class AdamW(torch.optim.Optimizer):
 
                 alpha_t = lr * math.sqrt(1 - beta2**t) / (1 - beta1**t)
                 denom = v.sqrt().add_(eps)
-                p.data.addcdiv_(m, denom, value=-alpha_t)
+                p.data.add_((-alpha_t * m / denom).to(dtype=p.data.dtype))
 
         return loss

@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +28,30 @@ METRIC_FIELDS = [
     "split",
     "loss",
     "learning_rate",
+    "total_processed_tokens",
     "elapsed_seconds",
+]
+
+PERFORMANCE_FIELDS = [
+    "iteration",
+    "epoch",
+    "batch",
+    "micro_batch_size",
+    "gradient_accumulation_steps",
+    "effective_batch_size",
+    "context_length",
+    "total_processed_tokens",
+    "step_seconds",
+    "data_wait_seconds",
+    "forward_seconds",
+    "backward_seconds",
+    "optimizer_seconds",
+    "tokens_per_second",
+    "device",
+    "gpu_utilization_percent",
+    "gpu_memory_allocated_gb",
+    "gpu_memory_reserved_gb",
+    "mps_driver_allocated_gb",
 ]
 
 
@@ -65,6 +89,53 @@ def _resolve_device(configured_device: str | None) -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def _normalize_dtype_name(dtype_name: Any) -> str:
+    return str(dtype_name).strip().lower().replace("-", "").replace("_", "")
+
+
+def _resolve_weight_dtype(config: dict[str, Any]) -> tuple[str, torch.dtype]:
+    dtype_name = _first_config_value(
+        config,
+        ("model", "dtype"),
+        ("model", "weight_dtype"),
+        "dtype",
+        "weight_dtype",
+        ("training", "dtype"),
+        ("training", "weight_dtype"),
+        default="fp32",
+    )
+    normalized = _normalize_dtype_name(dtype_name)
+    supported_dtypes = {
+        "fp32": ("fp32", torch.float32),
+        "float32": ("fp32", torch.float32),
+        "fp16": ("fp16", torch.float16),
+        "float16": ("fp16", torch.float16),
+        "half": ("fp16", torch.float16),
+        "bf16": ("bf16", torch.bfloat16),
+        "bfloat16": ("bf16", torch.bfloat16),
+    }
+    if normalized in supported_dtypes:
+        return supported_dtypes[normalized]
+
+    unsupported_float8 = {
+        "fp8",
+        "float8",
+        "float8e4m3fn",
+        "e4m3fn",
+        "bf8",
+        "float8e5m2",
+        "e5m2",
+    }
+    if normalized in unsupported_float8:
+        raise ValueError(
+            f"Weight dtype {dtype_name!r} is recognized, but this trainer does not support raw float8 "
+            "training. Use fp32, bf16, or fp16. FP8/BF8 training needs explicit scaling and "
+            "float8-aware kernels rather than simply casting model weights."
+        )
+
+    raise ValueError(f"Unsupported weight dtype {dtype_name!r}. Expected one of: fp32, bf16, fp16, fp8, bf8.")
 
 
 def _load_memmapped_npy(path: str | os.PathLike, name: str, context_length: int) -> np.memmap:
@@ -123,19 +194,31 @@ def _compute_steps_per_epoch(config: dict[str, Any], train_data: np.memmap, batc
     return max(1, (len(train_data) - 1) // (batch_size * context_length))
 
 
+def _compute_max_iterations(config: dict[str, Any], steps_per_epoch: int) -> int:
+    configured_iterations = _first_config_value(
+        config,
+        ("training", "num_iterations"),
+        ("training", "num_iterrations"),
+        "num_iterations",
+        "num_iterrations",
+        ("training", "max_iters"),
+        "max_iters",
+    )
+    if configured_iterations is not None:
+        return max(0, int(configured_iterations))
+
+    training_config = config.get("training", {})
+    num_epochs = int(training_config.get("num_epochs", config.get("num_epochs", 1)))
+    return max(0, num_epochs * steps_per_epoch)
+
+
 def _learning_rate_for_iteration(config: dict[str, Any], iteration: int, max_iterations: int) -> float:
     optimizer_config = config.get("optimizer", {})
-    training_config = config.get("training", {})
     base_lr = float(optimizer_config.get("lr", config.get("learning_rate", 1e-3)))
-    max_lr = float(training_config.get("max_learning_rate", base_lr))
-    min_lr = float(training_config.get("min_learning_rate", base_lr))
-    warmup_iters = int(training_config.get("warmup_iters", 0))
-    cosine_cycle_iters = int(training_config.get("cosine_cycle_iters", max_iterations))
-
-    if cosine_cycle_iters <= warmup_iters:
-        if warmup_iters > 0 and iteration < warmup_iters:
-            return iteration * max_lr / warmup_iters
-        return min_lr
+    max_lr = float(optimizer_config.get("max_learning_rate", base_lr))
+    min_lr = float(optimizer_config.get("min_learning_rate", base_lr))
+    warmup_iters = int(optimizer_config.get("warmup_iters", 0))
+    cosine_cycle_iters = int(optimizer_config.get("cosine_cycle_iters", max_iterations))
 
     return learning_rate_cosine_anneal(
         iteration,
@@ -151,9 +234,39 @@ def _set_optimizer_lr(optimizer: torch.optim.Optimizer, learning_rate: float) ->
         group["lr"] = learning_rate
 
 
+def _synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+
+def _device_performance_stats(device: torch.device) -> dict[str, str]:
+    if device.type == "cuda":
+        return {
+            "gpu_utilization_percent": "",
+            "gpu_memory_allocated_gb": f"{torch.cuda.memory_allocated(device) / 1e9:.3f}",
+            "gpu_memory_reserved_gb": f"{torch.cuda.memory_reserved(device) / 1e9:.3f}",
+            "mps_driver_allocated_gb": "",
+        }
+    if device.type == "mps":
+        return {
+            "gpu_utilization_percent": "",
+            "gpu_memory_allocated_gb": f"{torch.mps.current_allocated_memory() / 1e9:.3f}",
+            "gpu_memory_reserved_gb": "",
+            "mps_driver_allocated_gb": f"{torch.mps.driver_allocated_memory() / 1e9:.3f}",
+        }
+    return {
+        "gpu_utilization_percent": "",
+        "gpu_memory_allocated_gb": "",
+        "gpu_memory_reserved_gb": "",
+        "mps_driver_allocated_gb": "",
+    }
+
+
 def _lm_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     vocab_size = logits.shape[-1]
-    return cross_entropy(logits.reshape(-1, vocab_size), targets.reshape(-1))
+    return cross_entropy(logits.float().reshape(-1, vocab_size), targets.reshape(-1))
 
 
 @torch.no_grad()
@@ -179,6 +292,15 @@ def _append_metric(metrics_path: Path, row: dict[str, Any]) -> None:
     is_new_file = not metrics_path.exists()
     with metrics_path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=METRIC_FIELDS)
+        if is_new_file:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def _append_performance(performance_path: Path, row: dict[str, Any]) -> None:
+    is_new_file = not performance_path.exists()
+    with performance_path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=PERFORMANCE_FIELDS)
         if is_new_file:
             writer.writeheader()
         writer.writerow(row)
@@ -271,6 +393,7 @@ def _log_metric(
     split: str,
     loss: float,
     learning_rate: float,
+    total_processed_tokens: int,
     start_time: float,
 ) -> None:
     row = {
@@ -281,10 +404,59 @@ def _log_metric(
         "split": split,
         "loss": f"{loss:.8f}",
         "learning_rate": f"{learning_rate:.12g}",
+        "total_processed_tokens": total_processed_tokens,
         "elapsed_seconds": f"{time.time() - start_time:.3f}",
     }
     _append_metric(metrics_path, row)
     _write_loss_plot(metrics_path, plot_path)
+
+
+def _log_performance(
+    performance_path: Path,
+    iteration: int,
+    epoch: int,
+    batch: int,
+    batch_size: int,
+    gradient_accumulation_steps: int,
+    context_length: int,
+    timings: dict[str, float],
+    device: torch.device,
+) -> None:
+    step_seconds = timings["step"]
+    effective_batch_size = batch_size * gradient_accumulation_steps
+    total_processed_tokens = iteration * effective_batch_size * context_length
+    tokens_per_second = effective_batch_size * context_length / step_seconds if step_seconds > 0 else 0.0
+    row = {
+        "iteration": iteration,
+        "epoch": epoch,
+        "batch": batch,
+        "micro_batch_size": batch_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "effective_batch_size": effective_batch_size,
+        "context_length": context_length,
+        "total_processed_tokens": total_processed_tokens,
+        "step_seconds": f"{step_seconds:.6f}",
+        "data_wait_seconds": f"{timings['data_wait']:.6f}",
+        "forward_seconds": f"{timings['forward']:.6f}",
+        "backward_seconds": f"{timings['backward']:.6f}",
+        "optimizer_seconds": f"{timings['optimizer']:.6f}",
+        "tokens_per_second": f"{tokens_per_second:.2f}",
+        "device": str(device),
+        **_device_performance_stats(device),
+    }
+    _append_performance(performance_path, row)
+    memory_parts = []
+    if row["gpu_memory_allocated_gb"]:
+        memory_parts.append(f"gpu_mem={row['gpu_memory_allocated_gb']}GB")
+    if row["mps_driver_allocated_gb"]:
+        memory_parts.append(f"mps_driver={row['mps_driver_allocated_gb']}GB")
+    memory_summary = f" {' '.join(memory_parts)}" if memory_parts else ""
+    print(
+        f"perf iter {iteration}: step={step_seconds:.3f}s data={timings['data_wait']:.3f}s "
+        f"fwd={timings['forward']:.3f}s bwd={timings['backward']:.3f}s "
+        f"opt={timings['optimizer']:.3f}s tokens/s={tokens_per_second:.0f} "
+        f"total_tokens={total_processed_tokens}{memory_summary}"
+    )
 
 
 def _checkpoint_paths(run_dir: Path, iteration: int, epoch: int | None = None) -> list[Path]:
@@ -305,13 +477,55 @@ def _save_checkpoint_set(
         save_checkpoint(model, optimizer, iteration, checkpoint_path)
 
 
+def _matching_run_dirs(output_dir: Path, config_stem: str) -> list[Path]:
+    if not output_dir.exists():
+        return []
+
+    exact_suffix = f"-{config_stem}"
+    numbered_suffix_marker = f"{exact_suffix}-"
+    return sorted(
+        [
+            path
+            for path in output_dir.iterdir()
+            if path.is_dir()
+            and (
+                path.name.endswith(exact_suffix)
+                or (
+                    numbered_suffix_marker in path.name
+                    and path.name.rsplit(numbered_suffix_marker, maxsplit=1)[1].isdigit()
+                )
+            )
+        ],
+        key=lambda path: path.name,
+    )
+
+
+def _resolve_run_dir(output_dir: Path, config_stem: str, resume: str | os.PathLike | None) -> Path:
+    if resume is not None and str(resume) == "latest":
+        candidates = _matching_run_dirs(output_dir, config_stem)
+        if candidates:
+            return candidates[-1]
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_dir = output_dir / f"{timestamp}-{config_stem}"
+    if not run_dir.exists():
+        return run_dir
+
+    suffix = 2
+    while True:
+        suffixed_run_dir = output_dir / f"{timestamp}-{config_stem}-{suffix}"
+        if not suffixed_run_dir.exists():
+            return suffixed_run_dir
+        suffix += 1
+
+
 def train(config_path: str | os.PathLike, resume: str | os.PathLike | None = None) -> Path:
     config_path = Path(config_path)
     with config_path.open(encoding="utf-8") as f:
         config = json.load(f)
 
     output_dir = Path(config.get("output_dir", "./logs"))
-    run_dir = output_dir / config_path.stem
+    run_dir = _resolve_run_dir(output_dir, config_path.stem, resume)
     run_dir.mkdir(parents=True, exist_ok=True)
     copied_config_path = run_dir / "config.json"
     if config_path.resolve() != copied_config_path.resolve():
@@ -322,15 +536,18 @@ def train(config_path: str | os.PathLike, resume: str | os.PathLike | None = Non
     torch.manual_seed(seed)
 
     device = _resolve_device(config.get("device"))
-    model = _build_model(config).to(device)
+    dtype_name, weight_dtype = _resolve_weight_dtype(config)
+    model = _build_model(config).to(device=device, dtype=weight_dtype)
     optimizer = _build_optimizer(config, model)
 
     model_config = config.get("model", {})
     training_config = config.get("training", {})
     context_length = int(model_config.get("context_length", config.get("context_length")))
     batch_size = int(training_config.get("batch_size", config.get("batch_size", 32)))
+    gradient_accumulation_steps = max(1, int(training_config.get("gradient_accumulation_steps", 1)))
     eval_iters = max(1, int(training_config.get("eval_iters", config.get("eval_iters", 10))))
     log_every = int(training_config.get("log_every", training_config.get("log_every_n_batches", 100)))
+    performance_log_every = int(training_config.get("performance_log_every", 100))
     checkpoint_every = int(training_config.get("checkpoint_every", config.get("checkpoint_every", 0)))
     gradient_clip = training_config.get("gradient_clip", training_config.get("max_l2_norm"))
 
@@ -339,9 +556,9 @@ def train(config_path: str | os.PathLike, resume: str | os.PathLike | None = Non
     train_data = _load_memmapped_npy(train_path, "training", context_length)
     val_data = _load_memmapped_npy(val_path, "validation", context_length)
 
-    steps_per_epoch = _compute_steps_per_epoch(config, train_data, batch_size, context_length)
-    num_epochs = int(training_config.get("num_epochs", config.get("num_epochs", 1)))
-    max_iterations = int(training_config.get("max_iters", config.get("max_iters", num_epochs * steps_per_epoch)))
+    effective_batch_size = batch_size * gradient_accumulation_steps
+    steps_per_epoch = _compute_steps_per_epoch(config, train_data, effective_batch_size, context_length)
+    max_iterations = _compute_max_iterations(config, steps_per_epoch)
 
     start_iteration = 0
     if resume is not None:
@@ -350,17 +567,38 @@ def train(config_path: str | os.PathLike, resume: str | os.PathLike | None = Non
         print(f"Resumed from {resume_path} at iteration {start_iteration}")
 
     metrics_path = run_dir / "metrics.csv"
+    performance_path = run_dir / "performance.csv"
     plot_path = run_dir / "loss.svg"
     start_time = time.time()
 
     model.train()
     iteration = start_iteration
     start_epoch = start_iteration // steps_per_epoch
+    epoch_slots = (max_iterations + steps_per_epoch - 1) // steps_per_epoch
 
-    print(f"Training on {device} for up to {max_iterations} iterations")
+    print(f"Training on {device} for up to {max_iterations} optimizer iterations")
+    print(f"Weight dtype: {dtype_name}")
+    print(f"Steps per epoch: {steps_per_epoch} optimizer iterations")
+    print(
+        f"Micro-batch size {batch_size}, gradient accumulation {gradient_accumulation_steps}, "
+        f"effective batch size {effective_batch_size}"
+    )
+    min_learning_rate = float(training_config.get("min_learning_rate", optimizer.param_groups[0]["lr"]))
+    warmup_iters = int(training_config.get("warmup_iters", 0))
+    cosine_cycle_iters = int(training_config.get("cosine_cycle_iters", max_iterations))
+    min_learning_rate_step = max(warmup_iters, cosine_cycle_iters)
+    min_learning_rate_note = (
+        f"reached after {min_learning_rate_step} optimizer steps"
+        if min_learning_rate_step <= max_iterations
+        else f"not reached within this run; scheduled after {min_learning_rate_step} optimizer steps"
+    )
+    print(
+        f"Total optimizer steps: {max_iterations}; minimum learning rate {min_learning_rate:.3g} "
+        f"{min_learning_rate_note}"
+    )
     print(f"Writing outputs to {run_dir}")
 
-    for epoch_index in range(start_epoch, num_epochs):
+    for epoch_index in range(start_epoch, epoch_slots):
         epoch_number = epoch_index + 1
         first_batch = start_iteration % steps_per_epoch if epoch_index == start_epoch else 0
         epoch_loss_sum = 0.0
@@ -373,18 +611,68 @@ def train(config_path: str | os.PathLike, resume: str | os.PathLike | None = Non
             learning_rate = _learning_rate_for_iteration(config, iteration, max_iterations)
             _set_optimizer_lr(optimizer, learning_rate)
 
-            inputs, targets = get_batch(train_data, batch_size, context_length, str(device))
+            next_iteration = iteration + 1
+            should_log_performance = performance_log_every > 0 and next_iteration % performance_log_every == 0
+            timings = {
+                "data_wait": 0.0,
+                "forward": 0.0,
+                "backward": 0.0,
+                "optimizer": 0.0,
+            }
+            if should_log_performance:
+                _synchronize_device(device)
+            step_start = time.perf_counter()
             optimizer.zero_grad()
-            loss = _lm_loss(model(inputs), targets)
-            loss.backward()
+
+            accumulated_loss = 0.0
+            for _ in range(gradient_accumulation_steps):
+                phase_start = time.perf_counter()
+                inputs, targets = get_batch(train_data, batch_size, context_length, str(device))
+                if should_log_performance:
+                    _synchronize_device(device)
+                timings["data_wait"] += time.perf_counter() - phase_start
+
+                phase_start = time.perf_counter()
+                logits = model(inputs)
+                loss = _lm_loss(logits, targets)
+                if should_log_performance:
+                    _synchronize_device(device)
+                timings["forward"] += time.perf_counter() - phase_start
+
+                accumulated_loss += float(loss.item())
+                phase_start = time.perf_counter()
+                (loss / gradient_accumulation_steps).backward()
+                if should_log_performance:
+                    _synchronize_device(device)
+                timings["backward"] += time.perf_counter() - phase_start
+
             if gradient_clip is not None:
                 gradient_clipping(model.parameters(), float(gradient_clip))
+            phase_start = time.perf_counter()
             optimizer.step()
+            if should_log_performance:
+                _synchronize_device(device)
+            timings["optimizer"] = time.perf_counter() - phase_start
+            timings["step"] = time.perf_counter() - step_start
 
             iteration += 1
-            current_loss = float(loss.item())
+            current_loss = accumulated_loss / gradient_accumulation_steps
             epoch_loss_sum += current_loss
             epoch_loss_count += 1
+            total_processed_tokens = iteration * effective_batch_size * context_length
+
+            if should_log_performance:
+                _log_performance(
+                    performance_path,
+                    iteration,
+                    epoch_number,
+                    batch_index + 1,
+                    batch_size,
+                    gradient_accumulation_steps,
+                    context_length,
+                    timings,
+                    device,
+                )
 
             if log_every > 0 and iteration % log_every == 0:
                 val_loss = _estimate_loss(model, val_data, batch_size, context_length, device, eval_iters)
@@ -398,6 +686,7 @@ def train(config_path: str | os.PathLike, resume: str | os.PathLike | None = Non
                     "train",
                     current_loss,
                     learning_rate,
+                    total_processed_tokens,
                     start_time,
                 )
                 _log_metric(
@@ -410,11 +699,13 @@ def train(config_path: str | os.PathLike, resume: str | os.PathLike | None = Non
                     "val",
                     val_loss,
                     learning_rate,
+                    total_processed_tokens,
                     start_time,
                 )
                 print(
                     f"iter {iteration}: train_loss={current_loss:.4f} "
-                    f"val_loss={val_loss:.4f} lr={learning_rate:.3g}"
+                    f"val_loss={val_loss:.4f} lr={learning_rate:.3g} "
+                    f"tokens={total_processed_tokens}"
                 )
 
             if checkpoint_every > 0 and iteration % checkpoint_every == 0:
@@ -424,6 +715,7 @@ def train(config_path: str | os.PathLike, resume: str | os.PathLike | None = Non
             learning_rate = _learning_rate_for_iteration(config, iteration, max_iterations)
             avg_train_loss = epoch_loss_sum / epoch_loss_count
             val_loss = _estimate_loss(model, val_data, batch_size, context_length, device, eval_iters)
+            total_processed_tokens = iteration * effective_batch_size * context_length
             _log_metric(
                 metrics_path,
                 plot_path,
@@ -434,6 +726,7 @@ def train(config_path: str | os.PathLike, resume: str | os.PathLike | None = Non
                 "train",
                 avg_train_loss,
                 learning_rate,
+                total_processed_tokens,
                 start_time,
             )
             _log_metric(
@@ -446,10 +739,14 @@ def train(config_path: str | os.PathLike, resume: str | os.PathLike | None = Non
                 "val",
                 val_loss,
                 learning_rate,
+                total_processed_tokens,
                 start_time,
             )
             _save_checkpoint_set(model, optimizer, iteration, run_dir, epoch=epoch_number)
-            print(f"epoch {epoch_number}: train_loss={avg_train_loss:.4f} val_loss={val_loss:.4f}")
+            print(
+                f"epoch {epoch_number}: train_loss={avg_train_loss:.4f} "
+                f"val_loss={val_loss:.4f} tokens={total_processed_tokens}"
+            )
 
         if iteration >= max_iterations:
             break
@@ -461,7 +758,13 @@ def train(config_path: str | os.PathLike, resume: str | os.PathLike | None = Non
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train a TransformerLM from a JSON config.")
-    parser.add_argument("config", help="Path to a JSON training config.")
+    parser.add_argument("configs", nargs="+", help="Path(s) to JSON training config files.")
+    parser.add_argument(
+        "--batch_mode",
+        "--batch-mode",
+        action="store_true",
+        help="Run multiple config files sequentially in one command.",
+    )
     parser.add_argument(
         "--resume",
         nargs="?",
@@ -469,12 +772,29 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Resume from a checkpoint path. If no path is supplied, uses checkpoint_latest.pt in the run folder.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if len(args.configs) > 1 and not args.batch_mode:
+        parser.error("multiple config paths require --batch_mode")
+    return args
 
 
 def main() -> None:
     args = parse_args()
-    run_dir = train(args.config, resume=args.resume)
+    if args.batch_mode:
+        print(f"Batch mode: running {len(args.configs)} configs sequentially")
+        run_dirs = []
+        for index, config_path in enumerate(args.configs, start=1):
+            print(f"\nBatch run {index}/{len(args.configs)}: {config_path}")
+            run_dir = train(config_path, resume=args.resume)
+            run_dirs.append(run_dir)
+            print(f"Batch run {index}/{len(args.configs)} done. Run artifacts are in {run_dir}")
+
+        print("Batch mode complete. Run artifacts:")
+        for run_dir in run_dirs:
+            print(f"  {run_dir}")
+        return
+
+    run_dir = train(args.configs[0], resume=args.resume)
     print(f"Done. Run artifacts are in {run_dir}")
 
 
